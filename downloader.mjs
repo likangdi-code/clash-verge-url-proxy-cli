@@ -34,7 +34,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
@@ -43,8 +43,59 @@ import { fileURLToPath } from 'node:url'
 /** 脚本所在目录（install 脚本把 aria2c 装到同目录 bin/ 下） */
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 
+// Windows 注册表 PATH 兜底：进程的 process.env.PATH 是「改注册表之前」启动的旧快照，
+// 可能不含新装的目录（如 aria2）。这里用 reg query 直接读注册表，把新目录并进扫描列表。
+// 零依赖：spawnSync + TextDecoder（Node 内置 ICU，可解 GBK/OEM 编码）。
+const REG_PATH_KEYS = [
+  'HKCU\\Environment', // 用户 PATH
+  'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment', // 系统 PATH
+]
+
+/** 解码 reg.exe 输出：可能为 UTF-8 / GBK（中文 Windows 的 OEM 码页）/ UTF-16LE */
+function decodeReg(buf) {
+  if (!buf || buf.length === 0) return ''
+  // UTF-16LE：带 BOM 或偶数位置大量空字节
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return buf.subarray(2).toString('utf16le')
+  let oddNull = 0
+  let evenNull = 0
+  for (let i = 0; i + 1 < buf.length; i += 2) {
+    if (buf[i] === 0) evenNull++
+    if (buf[i + 1] === 0) oddNull++
+  }
+  if (oddNull > evenNull) return buf.toString('utf16le')
+  // 先按 UTF-8 解；出现 U+FFFD 替换符说明是 GBK/OEM（中文 Windows 的 reg 常见）→ 用 GBK 兜底
+  const utf8 = buf.toString('utf8')
+  if (!utf8.includes('\uFFFD')) return utf8
+  try {
+    return new TextDecoder('gbk').decode(buf)
+  } catch {
+    return utf8 // ICU 无 gbk（极少见）时退回，个别中文目录可能乱码，但不影响存在性判断
+  }
+}
+
+/** 读注册表 PATH 值 → 目录列表（展开 %VAR% 后按 path.delimiter 切分）；reg 失败静默跳过 */
+function readRegistryPathDirs() {
+  const dirs = []
+  for (const hive of REG_PATH_KEYS) {
+    try {
+      const r = spawnSync('reg', ['query', hive, '/v', 'Path'], { encoding: 'buffer', windowsHide: true, timeout: 5000 })
+      if (r.error || r.status !== 0) continue // reg 不存在 / 权限不足 / 无该值 → 静默跳过
+      // reg 输出形如：\r\nHKEY_...\r\n    Path    REG_(EXPAND_)?SZ    <值>\r\n\r\n
+      const m = decodeReg(r.stdout).match(/^\s*Path\s+REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/im)
+      if (!m) continue
+      // 展开 %VAR%：SystemRoot / LOCALAPPDATA 等系统级变量在进程 env 快照里都有；缺失则保留原样
+      const value = m[1].replace(/%([^%]+)%/g, (orig, name) => process.env[name] ?? orig)
+      for (const d of value.split(path.delimiter)) {
+        const dir = d.trim()
+        if (dir) dirs.push(dir)
+      }
+    } catch { /* 任何异常静默跳过，不阻断探测 */ }
+  }
+  return dirs
+}
+
 /**
- * 找 aria2c：安装目录 bin/（install 脚本主动安装的位置，优先）→ PATH。
+ * 找 aria2c：安装目录 bin/（install 脚本主动安装的位置，优先）→ PATH（含注册表 PATH 兜底）。
  * 只认官方二进制（Windows 的 aria2c.exe / Unix 的 aria2c），不再探测
  * .cmd/.bat 第三方 shim——那些 shim 需要走 cmd shell 转义，是高危 bug 源
  * （cmd 下 \" 不是转义引号，含 &/%/! 的 URL/认证头会被破坏），已随
@@ -52,13 +103,17 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
  */
 export function findAria2c() {
   const names = process.platform === 'win32' ? ['aria2c.exe'] : ['aria2c']
+  // 1. 安装目录 bin/（脚本同目录，install 主动装的位置）
   for (const n of names) {
     try {
       const p = path.join(SCRIPT_DIR, 'bin', n)
       if (fs.existsSync(p)) return p
     } catch { /* 路径非法跳过 */ }
   }
+  // 2. 进程 PATH 快照
   const pathDirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)
+  // 3. Windows 注册表 PATH 兜底（进程 PATH 是旧快照、不含新装目录时）
+  if (process.platform === 'win32') pathDirs.push(...readRegistryPathDirs())
   for (const dir of pathDirs) {
     for (const n of names) {
       try {
@@ -579,9 +634,13 @@ export async function download(urlStr, { proxyPort, threads = 8, output, dir = '
       if (!filename) filename = guessFilename(info.url, info.disposition)
     } catch (e) {
       // 预解析失败（如 401/403 需认证）→ 不降级，直接把错误抛给上层（有清晰提示）
-      // 但若只是探测超时等瞬时问题，仍允许 aria2c 直接尝试原始 URL
+      // 但若只是探测超时/连接等瞬时问题，仍允许 aria2c 直接尝试原始 URL。
+      // 注意：AbortSignal.timeout 抛的是 DOMException(TimeoutError, "The operation was
+      // aborted due to timeout")——英文 "timeout/aborted" 也必须算瞬时问题，否则探测超时
+      // 会把整个下载 abort 掉（即使 aria2c 本可正常下载）。
       if (e instanceof Error && /HTTP 401|HTTP 403/.test(e.message)) throw e
-      if (!/重定向|超时|socket|connect/i.test(e.message)) throw e
+      const transient = e?.name === 'TimeoutError' || /重定向|超时|timeout|socket|connect|aborted/i.test(e?.message ?? '')
+      if (!transient) throw e
     }
     // 主路径：JSON-RPC（结构化进度 + 精确错误分类）；RPC 实例起不来再回退一次性 spawn
     const rpcRes = await runAria2cRpc(finalUrl, { proxyPort, threads, output: filename, dir, ariaPath: aria, headers: ariaHeaders, onProgress })
