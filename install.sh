@@ -42,6 +42,25 @@ exec node "$(dirname "$0")/clash-proxy.mjs" dl "$@"
 WRAP
 chmod +x "$INSTALL_DIR/clash-dl"
 
+# 4.5 aria2c 多线程下载引擎（dl/clash-dl 的主引擎）：已装跳过；
+#     未装尝试包管理器自动安装（失败不阻塞——clash-dl 会用内置 Node 分片下载器兜底）
+if ! command -v aria2c >/dev/null 2>&1; then
+  echo "尝试安装 aria2c 多线程下载引擎…"
+  if command -v brew >/dev/null 2>&1; then
+    brew install aria2 || echo "（brew 安装失败，可稍后手动: brew install aria2）"
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo -n apt-get install -y aria2 2>/dev/null || echo "（需要 sudo 权限，可稍后手动: sudo apt-get install aria2）"
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo -n dnf install -y aria2 2>/dev/null || echo "（需要 sudo 权限，可稍后手动: sudo dnf install aria2）"
+  elif command -v pacman >/dev/null 2>&1; then
+    sudo -n pacman -S --noconfirm aria2 2>/dev/null || echo "（需要 sudo 权限，可稍后手动: sudo pacman -S aria2）"
+  else
+    echo "（未识别到包管理器，可手动安装 aria2c 获得多线程下载）"
+  fi
+else
+  echo "aria2c 已可用（多线程下载引擎），跳过安装"
+fi
+
 # 5. 加入 PATH（幂等：追加到第一个存在的 rc 文件）
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) : ;;
@@ -70,6 +89,11 @@ fi
 # 7. 汇总提示
 echo ""
 echo "✓ clash-proxy 工具安装完成（未安装 skill）。"
+if command -v aria2c >/dev/null 2>&1; then
+  echo "  下载引擎: aria2c（多线程主引擎，RPC 控制）"
+else
+  echo "  下载引擎: 内置 Node 分片下载器（aria2c 未就绪，可手动安装获得多线程加速）"
+fi
 echo "  新开终端后可直接："
 echo "    clash-proxy list"
 echo "    clash-proxy pick \"https://example.com/big-file.zip\""

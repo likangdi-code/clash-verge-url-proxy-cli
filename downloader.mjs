@@ -2,14 +2,21 @@
 /**
  * downloader.mjs — 走代理的多线程下载引擎（clash-proxy dl 用）
  *
- * 混合引擎：
- *   1. 探测 aria2c（业界最强开源多线程下载器）：装了 → spawn aria2c 满速下载
- *      （-x 多连接、-s 分片、-k 分片大小、-c 断点续传、--all-proxy 走 mihomo 混入端口）
- *   2. 没装 → 内置纯 Node 零依赖下载器（基于内置 fetch / undici）
+ * 混合引擎（三层，逐级回退）：
+ *   1. aria2 JSON-RPC（主路径）：启动专属 aria2 RPC 实例（随机端口 + secret），
+ *      aria2.addUri 提交下载、轮询 aria2.tellStatus 拿结构化状态——
+ *      status/completedLength/totalLength/downloadSpeed/errorCode/errorMessage，
+ *      进度字节级上报（--json 模式也准确），错误精确分类（超时/404/磁盘满/认证失败）；
+ *      --stop-with-process 绑定本进程，node 退出 aria2 自动退出，不留孤儿；
+ *      Ctrl+C 中断后 .aria2 控制文件保留，下次自动续传。
+ *   2. legacy spawn（回退）：RPC 实例起不来时一次性 spawn aria2c（只拿退出码）。
+ *   3. 内置纯 Node 零依赖下载器（兜底）：没装 aria2c 时用（基于内置 fetch / undici）。
+ *      aria2c 由 install.ps1 / install.sh 主动安装（Windows 官方二进制 → bin/；
+ *      macOS/Linux 走包管理器），正常情况下主路径 1 常备。
  *
  * 关键设计：用 Node 内置 fetch 预解析重定向链（redirect:follow 自动跨域剥离
  * Authorization/Cookie），解决 aria2c 的硬伤——aria2c 会把 --header 原样带到
- * 重定向后的 CDN 域名导致 401。预解析拿到最终签名 URL 后再交给 aria2c，缺陷绕开。
+ * 重定向后的 CDN 域名导致 401。预解析拿到最终签名 URL 后再交给 aria2，缺陷绕开。
  * 零 npm 依赖：fetch / undici 是 Node 18.17+ 内置。
  *
  * 非公开 URL（需认证）支持：
@@ -21,20 +28,36 @@
  *   node downloader.mjs <url> [--proxy-port 7897] [--threads 8] [-o 文件名] [-d 目录]
  *   node downloader.mjs <url> --header "Authorization: Bearer <token>" --header "Cookie: a=b"
  *
- * 返回：Promise<{ok, engine, filePath, bytes, threads, durationMs, error?}>
+ * 返回：Promise<{ok, engine, filePath, bytes, threads, durationMs, error?, errorCode?}>
+ *       engine: 'aria2c-rpc'（主路径）| 'aria2c'（legacy 回退）| 'node'（兜底）
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import http from 'node:http'
 import { spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 // ─── aria2c 探测 ─────────────────────────────────────────────────────────────
 
-/** 在 PATH 中找 aria2c（win 平台同时兼容 aria2c.exe / .cmd / .bat 包装） */
+/** 脚本所在目录（install 脚本把 aria2c 装到同目录 bin/ 下） */
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
+
+/**
+ * 找 aria2c：安装目录 bin/（install 脚本主动安装的位置，优先）→ PATH。
+ * 只认官方二进制（Windows 的 aria2c.exe / Unix 的 aria2c），不再探测
+ * .cmd/.bat 第三方 shim——那些 shim 需要走 cmd shell 转义，是高危 bug 源
+ * （cmd 下 \" 不是转义引号，含 &/%/! 的 URL/认证头会被破坏），已随
+ * shell:true 路径一并移除。
+ */
 export function findAria2c() {
-  const names = process.platform === 'win32'
-    ? ['aria2c.exe', 'aria2c.cmd', 'aria2c.bat', 'aria2c']
-    : ['aria2c']
+  const names = process.platform === 'win32' ? ['aria2c.exe'] : ['aria2c']
+  for (const n of names) {
+    try {
+      const p = path.join(SCRIPT_DIR, 'bin', n)
+      if (fs.existsSync(p)) return p
+    } catch { /* 路径非法跳过 */ }
+  }
   const pathDirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)
   for (const dir of pathDirs) {
     for (const n of names) {
@@ -44,26 +67,157 @@ export function findAria2c() {
       } catch { /* 路径非法跳过 */ }
     }
   }
-  // Windows 常见安装目录兜底
-  if (process.platform === 'win32') {
-    for (const dir of [
-      path.join(process.env.LOCALAPPDATA ?? '', 'Programs', 'aria2'),
-      'C:\\Program Files\\aria2',
-      'C:\\aria2',
-    ]) {
-      for (const n of names) {
-        try {
-          const p = path.join(dir, n)
-          if (fs.existsSync(p)) return p
-        } catch {}
-      }
+  return null
+}
+
+// ─── aria2 JSON-RPC 引擎（主路径）──────────────────────────────────────────
+//
+// 启动一个专属 aria2 RPC 实例（--enable-rpc --rpc-secret 随机），通过
+// aria2.addUri 提交下载、轮询 aria2.tellStatus 拿结构化状态：
+// status / completedLength / totalLength / downloadSpeed / errorCode /
+// errorMessage。相比一次性 spawn 只拿退出码，这里能精确分类错误
+//（超时 / 404 / 磁盘满 / 认证失败），进度可字节级上报（--json 模式也准确）。
+// --stop-with-process=<node pid>：node 退出时 aria2 自动退出，不留孤儿进程；
+// Ctrl+C 中断后 .aria2 控制文件保留，continue=true 下次自动续传。
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/** 对本机 aria2 RPC 端点发 JSON-RPC POST，返回 {status, json} */
+function rpcPost(port, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body)
+    const req = http.request(
+      {
+        host: '127.0.0.1', port, path: '/jsonrpc', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+      },
+      (res) => {
+        let buf = ''
+        res.setEncoding('utf8')
+        res.on('data', (d) => (buf += d))
+        res.on('end', () => {
+          let json = null
+          try { json = JSON.parse(buf) } catch {}
+          resolve({ status: res.statusCode, json })
+        })
+      },
+    )
+    req.on('error', reject)
+    req.setTimeout(10000, () => req.destroy(new Error('aria2 RPC 请求超时')))
+    req.end(data)
+  })
+}
+
+/** 调用 aria2 RPC 方法（token 鉴权），json.error 时抛错 */
+async function rpcCall(port, secret, method, params) {
+  const { json } = await rpcPost(port, { jsonrpc: '2.0', id: 'clash-proxy', method, params: [`token:${secret}`, ...params] })
+  if (!json || json.error) throw new Error(`aria2 RPC ${method} 失败: ${json?.error?.message ?? '无响应'}`)
+  return json.result
+}
+
+/** 启动专属 aria2 RPC 实例并等待就绪（随机端口，最多重试 3 次；失败返回 null） */
+async function startAria2Rpc(ariaPath) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const port = 20000 + Math.floor(Math.random() * 20000)
+    const secret = randomBytes(12).toString('hex')
+    let exited = false
+    let child
+    try {
+      child = spawn(ariaPath, [
+        '--enable-rpc', `--rpc-listen-port=${port}`, `--rpc-secret=${secret}`,
+        '--rpc-listen-all=false', '--quiet=true',
+        `--stop-with-process=${process.pid}`, // node 退出 → aria2 自动退出（防孤儿进程）
+        '--auto-save-interval=10',            // 10s 存一次控制文件（中断后可续传）
+        '--continue=true',
+      ], { stdio: 'ignore', shell: false })
+    } catch { return null }
+    child.on('error', () => { exited = true })
+    child.on('close', () => { exited = true })
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline && !exited) {
+      try {
+        await rpcCall(port, secret, 'aria2.getVersion', [])
+        return { child, port, secret }
+      } catch { await sleep(150) }
     }
+    try { child.kill() } catch {}
   }
   return null
 }
 
-/** 用 aria2c 下载（默认继承 stdio 展示 aria2 自带进度条；json 模式下静默避免污染输出） */
-function runAria2c(url, { proxyPort, threads, output, dir, ariaPath, headers, jsonMode }) {
+/** 速度格式化（bytes/s → 人类可读） */
+function formatBps(n) {
+  return n && n > 0 ? formatBytes(n) + '/s' : '--'
+}
+
+/**
+ * aria2 JSON-RPC 下载（主路径）。
+ * 返回 null = RPC 实例启动失败（调用方回退 legacy spawn）；
+ * 下载中途 RPC 失联则如实返回 {ok:false}（错误信息可诊断）。
+ */
+async function runAria2cRpc(url, { proxyPort, threads, output, dir, ariaPath, headers, onProgress }) {
+  const rpc = await startAria2Rpc(ariaPath)
+  if (!rpc) return null
+  const { child, port, secret } = rpc
+  const started = Date.now()
+  // 归一化输出路径：-o 绝对路径 → 拆成 dir + out（aria2c 的 -o 只接受文件名）
+  const outDir = output && path.isAbsolute(output) ? path.dirname(output) : (dir ?? '.')
+  const outFile = output ? path.basename(output) : guessFilename(url, null)
+  const t = Math.max(1, Math.min(threads, 16)) // aria2 上限：max-connection-per-server ≤ 16
+  const options = {
+    dir: path.resolve(outDir),
+    out: outFile,
+    continue: 'true',
+    'max-connection-per-server': String(t),
+    split: String(t),
+    'min-split-size': '1M',
+    'allow-overwrite': 'true',
+    'auto-file-renaming': 'false',
+    'max-tries': '5',
+    'retry-wait': '2',
+  }
+  if (proxyPort) options['all-proxy'] = `http://127.0.0.1:${proxyPort}`
+  else options['no-proxy'] = '*'
+  if (headers) options.header = Object.entries(headers).map(([k, v]) => `${k}: ${v}`)
+  let gid = null
+  try {
+    gid = await rpcCall(port, secret, 'aria2.addUri', [[url], options])
+    let rpcFailures = 0
+    for (;;) {
+      await sleep(500)
+      let st
+      try {
+        st = await rpcCall(port, secret, 'aria2.tellStatus', [gid])
+        rpcFailures = 0
+      } catch (e) {
+        // RPC 失联（aria2 崩了）：连续 3 次才判定失败，避免瞬时抖动误杀
+        if (++rpcFailures >= 3) return { ok: false, engine: 'aria2c-rpc', filePath: path.join(outDir, outFile), error: `aria2 RPC 连接中断: ${e.message}`, threads: t, durationMs: Date.now() - started }
+        continue
+      }
+      const doneBytes = Number(st.completedLength ?? 0)
+      const total = Number(st.totalLength ?? 0)
+      onProgress?.({
+        doneBytes,
+        total: total > 0 ? total : null,
+        threads: t,
+        speed: formatBps(Number(st.downloadSpeed ?? 0)),
+        filename: outFile,
+      })
+      if (st.status === 'complete') {
+        return { ok: true, engine: 'aria2c-rpc', filePath: st.files?.[0]?.path ?? path.join(outDir, outFile), bytes: total, threads: t, durationMs: Date.now() - started }
+      }
+      if (st.status === 'error' || st.status === 'removed') {
+        return { ok: false, engine: 'aria2c-rpc', filePath: st.files?.[0]?.path ?? null, error: st.errorMessage ?? `aria2 状态 ${st.status}`, errorCode: st.errorCode ?? null, threads: t, durationMs: Date.now() - started }
+      }
+    }
+  } finally {
+    if (gid) { try { await rpcCall(port, secret, 'aria2.removeDownloadResult', [gid]) } catch {} }
+    try { child.kill() } catch {}
+  }
+}
+
+/** 用 aria2c 下载（legacy 回退：RPC 实例起不来时才用；只拿退出码，无结构化状态） */
+function runAria2cLegacy(url, { proxyPort, threads, output, dir, ariaPath, headers, jsonMode }) {
   return new Promise((resolve) => {
     const args = [
       '--auto-file-renaming=false',
@@ -77,26 +231,19 @@ function runAria2c(url, { proxyPort, threads, output, dir, ariaPath, headers, js
     if (proxyPort) args.push('--all-proxy', `http://127.0.0.1:${proxyPort}`)
     else args.push('--no-proxy', '*')
     for (const [k, v] of Object.entries(headers ?? {})) args.push(`--header=${k}: ${v}`)
-    if (output) args.push('-o', output)
+    // -o 只接受文件名：绝对路径拆成 -d + -o（与 RPC 引擎、Node 引擎语义一致）
+    if (output) {
+      if (path.isAbsolute(output)) args.push('-d', path.dirname(output), '-o', path.basename(output))
+      else args.push('-o', output)
+    }
     if (dir) args.push('-d', dir)
     args.push(url)
-
-    // Windows 下 aria2c 常以 aria2c.exe 存在，.cmd/.bat 包装时需走 cmd shell
-    const isBat = process.platform === 'win32' && /\.(cmd|bat)$/i.test(ariaPath ?? 'aria2c')
     // json 模式下静默（aria2c 进度输出会污染 stdout 的 JSON）；非 json 继承 stdio 展示进度
     const stdio = jsonMode ? 'ignore' : 'inherit'
-    let child
-    if (isBat) {
-      // cmd 下 URL 可能含 & 等元字符：把每个参数用双引号包裹后拼成命令行，
-      // 这样 cmd 把整个串当一个参数，避免 & 截断 / DEP0190 未转义警告
-      const quoted = args.map((a) => `"${a.replace(/"/g, '\\"')}"`).join(' ')
-      child = spawn(`"${ariaPath}" ${quoted}`, { stdio, shell: true })
-    } else {
-      child = spawn(ariaPath ?? 'aria2c', args, { stdio })
-    }
+    const child = spawn(ariaPath ?? 'aria2c', args, { stdio, shell: false })
     child.on('error', (e) => resolve({ ok: false, engine: 'aria2c', error: e.message }))
     child.on('close', (code) => {
-      resolve({ ok: code === 0, engine: 'aria2c', filePath: output ? path.join(dir ?? '.', output) : null, exitCode: code })
+      resolve({ ok: code === 0, engine: 'aria2c', filePath: output ? path.join(output && path.isAbsolute(output) ? path.dirname(output) : (dir ?? '.'), path.basename(output)) : null, exitCode: code })
     })
   })
 }
@@ -410,9 +557,10 @@ export async function downloadNode(urlStr, { proxyPort, threads = 4, output, dir
 // ─── 统一入口 ────────────────────────────────────────────────────────────────
 
 /**
- * 下载（混合引擎：优先 aria2c，缺失用内置 Node 下载器）
+ * 下载（混合引擎三层：aria2 JSON-RPC 主路径 → legacy spawn 回退 → 内置 Node 下载器兜底）
  * aria2c 路径：先用 fetch 预解析重定向链（跨域自动剥敏感头），拿到最终签名 URL
- * 后交给 aria2c——aria2c 无需认证头，绕开它「把 --header 带到 CDN」的硬伤。
+ * 后交给 aria2——绕开它「把 --header 带到 CDN」的硬伤；RPC 引擎提供结构化进度与
+ * 精确错误分类，RPC 实例起不来时回退一次性 spawn（只拿退出码）。
  * @param {string} urlStr
  * @param {{proxyPort:number|null, threads?:number, output?:string, dir?:string, forceNode?:boolean, headers?:Object, jsonMode?:boolean, onProgress?:Function}} opts
  */
@@ -435,7 +583,10 @@ export async function download(urlStr, { proxyPort, threads = 8, output, dir = '
       if (e instanceof Error && /HTTP 401|HTTP 403/.test(e.message)) throw e
       if (!/重定向|超时|socket|connect/i.test(e.message)) throw e
     }
-    return runAria2c(finalUrl, { proxyPort, threads, output: filename, dir, ariaPath: aria, headers: ariaHeaders, jsonMode })
+    // 主路径：JSON-RPC（结构化进度 + 精确错误分类）；RPC 实例起不来再回退一次性 spawn
+    const rpcRes = await runAria2cRpc(finalUrl, { proxyPort, threads, output: filename, dir, ariaPath: aria, headers: ariaHeaders, onProgress })
+    if (rpcRes) return rpcRes
+    return runAria2cLegacy(finalUrl, { proxyPort, threads, output: filename, dir, ariaPath: aria, headers: ariaHeaders, jsonMode })
   }
   ensureProxyEnv(proxyPort)
   return downloadNode(urlStr, { proxyPort, threads, output, dir, headers, onProgress })
@@ -475,7 +626,16 @@ async function main() {
   if (headerList.length) opts.headers = parseHeaders(headerList)
 
   let last = null
-  const res = await download(urlStr, { ...opts, jsonMode: opts.json, onProgress: (p) => { last = p } })
+  // 进度渲染：RPC / Node 引擎统一单行刷新（--json 静默避免污染输出）
+  const render = (p) => {
+    last = p
+    if (opts.json) return
+    const pct = p.total ? Math.min(100, Math.round((p.doneBytes / p.total) * 100)) : '?'
+    const line = `\r⏬ ${p.filename}  ${pct}%  ${formatBytes(p.doneBytes)}/${p.total ? formatBytes(p.total) : '?'}  ${p.speed ?? '--'}  ${p.threads}线程`
+    process.stdout.write(line.padEnd(Math.min(process.stdout.columns ?? 100, 100)))
+  }
+  const res = await download(urlStr, { ...opts, jsonMode: opts.json, onProgress: render })
+  if (!opts.json && res.engine !== 'aria2c') process.stdout.write('\r\x1b[K')
   if (res.ok && !res.filePath && res.engine === 'aria2c') {
     if (opts.json) {
       console.log(JSON.stringify({ ok: true, engine: 'aria2c', filePath: null, bytes: null, threads: opts.threads, durationMs: null }))
@@ -487,14 +647,20 @@ async function main() {
     return
   }
   if (res.ok) {
+    // 平均速度（完成瞬间瞬时速度归零，RPC 引擎用 bytes/duration 更真实）
+    const avgSpeed = res.bytes && res.durationMs ? formatBps((res.bytes / res.durationMs) * 1000) : null
     if (opts.json) {
-      console.log(JSON.stringify({ ok: true, engine: res.engine, filePath: res.filePath, bytes: res.bytes, threads: res.threads, durationMs: res.durationMs, speed: last ? last.speed : null }))
+      console.log(JSON.stringify({ ok: true, engine: res.engine, filePath: res.filePath, bytes: res.bytes, threads: res.threads, durationMs: res.durationMs, avgSpeed: avgSpeed ?? (last ? last.speed : null) }))
     } else {
-      console.log(`✓ 下载完成  ${res.filePath}  ${formatBytes(res.bytes)}  （${res.engine} ${res.threads} 线程, ${(res.durationMs / 1000).toFixed(1)}s${last ? ', ' + last.speed : ''}）`)
+      console.log(`✓ 下载完成  ${res.filePath}  ${formatBytes(res.bytes)}  （${res.engine} ${res.threads} 线程, ${(res.durationMs / 1000).toFixed(1)}s${avgSpeed ? ', ' + avgSpeed : ''}）`)
     }
     return
   }
-  console.error(`✗ 下载失败: ${res.error ?? `退出码 ${res.exitCode}`}`)
+  if (opts.json) {
+    console.log(JSON.stringify({ ok: false, engine: res.engine ?? null, filePath: res.filePath ?? null, error: res.error ?? `退出码 ${res.exitCode}`, errorCode: res.errorCode ?? null }))
+  } else {
+    console.error(`✗ 下载失败: ${res.error ?? `退出码 ${res.exitCode}`}`)
+  }
   process.exitCode = 1
 }
 

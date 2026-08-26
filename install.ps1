@@ -284,6 +284,56 @@ if ($skipped.Count -gt 0) {
     Write-Host "跳过 $($skipped.Count) 个未变化文件：$($skipped -join '、')" -ForegroundColor DarkGray
 }
 
+# 3.5 aria2c 多线程下载引擎（dl/clash-dl 的主引擎，主动安装）：
+#     已可用（PATH 或安装目录 bin\）→ 跳过；未装 → 下载官方 Windows 二进制到 bin\。
+#     下载后用 GitHub API 的 asset digest（SHA256）校验；API 不可用时降级不校验。
+#     安装失败不阻塞（clash-proxy 仍可用内置 Node 分片下载器兜底）。
+$aria2Ver = '1.37.0'
+$aria2ZipName = "aria2-$aria2Ver-win-64bit-build1.zip"
+$binDir = Join-Path $installDir 'bin'
+$aria2Exe = Join-Path $binDir 'aria2c.exe'
+# 与 Node 侧 findAria2c 语义一致：只认官方二进制（.exe）；.cmd/.bat 第三方 shim 不算可用
+#（Node spawn 不走 shell 时无法安全调 shim，装官方 exe 到 bin\ 才能成为 RPC 主引擎）
+$aria2Cmd = Get-Command aria2c -ErrorAction SilentlyContinue
+$aria2InPath = $aria2Cmd -and $aria2Cmd.Source -and ($aria2Cmd.Source -notmatch '\.(cmd|bat)$')
+$aria2Available = [bool]$aria2InPath -or (Test-Path $aria2Exe)
+if (-not $aria2Available) {
+    Write-Host ''
+    Write-Host "安装 aria2c 多线程下载引擎（v$aria2Ver）…" -ForegroundColor Cyan
+    $aria2Url = "https://github.com/aria2/aria2/releases/download/release-$aria2Ver/$aria2ZipName"
+    # 从 GitHub API 拿 asset digest 做哈希校验（不可用时降级为不校验，与工具文件更新逻辑一致）
+    $expectedSha = $null
+    try {
+        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/aria2/aria2/releases/tags/release-$aria2Ver" -Headers @{ 'User-Agent' = 'clash-proxy-install' } -UseBasicParsing
+        $asset = $rel.assets | Where-Object { $_.name -eq $aria2ZipName } | Select-Object -First 1
+        if ($asset -and $asset.digest -like 'sha256:*') { $expectedSha = $asset.digest.Substring(7).ToLower() }
+    } catch {}
+    # 老版 release（1.37.0 发布早于 GitHub API 提供 digest）→ 硬编码官方哈希兜底。
+    # 该值已双源验证：zip 解压出的 aria2c.exe 与 winget-pkgs manifest 安装的官方二进制逐字节一致（2026-08-26）。
+    if (-not $expectedSha) { $expectedSha = '67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288' }
+    $tmpZip = Join-Path $env:TEMP $aria2ZipName
+    $tmpDir = Join-Path $env:TEMP ("clash-proxy-aria2-" + [guid]::NewGuid().ToString('N'))
+    try {
+        Invoke-WebRequest -Uri $aria2Url -OutFile $tmpZip -UseBasicParsing
+        if ($expectedSha) {
+            $actualSha = (Get-FileHash $tmpZip -Algorithm SHA256).Hash.ToLower()
+            if ($actualSha -ne $expectedSha) { throw "SHA256 校验失败（预期 $($expectedSha.Substring(0,8))… 实际 $($actualSha.Substring(0,8))…）" }
+        }
+        Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
+        New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+        Copy-Item (Join-Path $tmpDir "aria2-$aria2Ver-win-64bit-build1\aria2c.exe") $aria2Exe -Force
+        Write-Host "✓ aria2c 已安装到 $binDir（dl 多线程下载主引擎）" -ForegroundColor Green
+    } catch {
+        Write-Host "⚠ aria2c 安装失败（$($_.Exception.Message)）。clash-dl 将使用内置 Node 分片下载器兜底；可稍后手动安装：winget install aria2.aria2" -ForegroundColor Yellow
+    } finally {
+        Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+} else {
+    Write-Host ''
+    Write-Host 'aria2c 已可用（多线程下载引擎），跳过安装' -ForegroundColor DarkGray
+}
+
 # 4. 生成命令包装 clash-proxy.cmd + clash-dl.cmd（均纯 ASCII，避免 cmd 代码页解析乱码）
 $cmdContent = "@echo off`r`nrem clash-proxy command wrapper`r`nnode `"%~dp0clash-proxy.mjs`" %*`r`n"
 Set-Content -Path (Join-Path $installDir 'clash-proxy.cmd') -Value $cmdContent -Encoding ASCII
@@ -342,6 +392,7 @@ if ($notFound.Count) {
 $env:Path = $userPath + ';' + $installDir + ';' + $env:Path
 Write-Host ''
 Write-Host '✓ clash-proxy 工具安装完成。' -ForegroundColor Green
+Write-Host "  下载引擎: $(if ($aria2Available) { 'aria2c（多线程主引擎，RPC 控制）' } else { '内置 Node 分片下载器（aria2c 未就绪）' })" -ForegroundColor DarkGray
 Write-Host '  新开终端（或刷新 PATH）后可直接：'
 Write-Host '    clash-proxy list'
 Write-Host '    clash-proxy pick "https://example.com/big-file.zip"'

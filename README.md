@@ -1,6 +1,8 @@
 # 🔀 Clash Proxy
 
-给 **agent / 脚本** 用的 mihomo 节点选择 CLI。**下载前为任意 URL 自动测出延迟最低的节点并切换**，随后走代理下载。可**自动建「网址代理」组**（配合 Clash Verge 网址代理版），也可复用已建好的组。**`dl` 命令把「选节点」和「多线程下载」合成一步**，下载前自动切最优节点、再用多线程引擎下载（自带零依赖 Node 分片下载器，装了 aria2c 则自动升级为 aria2c 满速下载）。
+> 版本跟随：`2.5.2-1`（与 Clash Verge 网址代理版 `clash-verge-url-proxy` 保持一致）
+
+给 **agent / 脚本** 用的 mihomo 节点选择 CLI。**下载前为任意 URL 自动测出延迟最低的节点并切换**，随后走代理下载。可**自动建「网址代理」组**（配合 Clash Verge 网址代理版），也可复用已建好的组。**`dl` 命令把「选节点」和「多线程下载」合成一步**，下载前自动切最优节点、再用多线程引擎下载（aria2c 主引擎由安装脚本自动安装，JSON-RPC 控制拿结构化进度与精确错误分类；未装时用内置零依赖 Node 分片下载器兜底）。
 
 ## 简介
 
@@ -187,14 +189,15 @@ clash-dl "https://github.com/owner/repo/releases/download/v1.0/app.zip" -d ~/Dow
 clash-proxy dl "https://github.com/owner/repo/releases/download/v1.0/app.zip" -d ~/Downloads -t 8
 ```
 
-引擎采用**混合方案**：
+引擎采用**混合三层**（逐级回退）：
 
 | 引擎 | 触发条件 | 能力 |
 |---|---|---|
-| **aria2c** | 系统中检测到 aria2c（PATH 或常见安装目录） | 多连接（`-x`）、分片（`-s -k`）、断点续传（`-c`）、走代理（`--all-proxy`）。业界标准，Motrix / imFile 等均基于它 |
-| **内置 Node 下载器** | 未装 aria2c（零依赖兜底） | HTTP Range 分片并发下载到 `.part`，完成后拼接；断点续传（完整分片自动跳过）；不支持 Range 或大小未知时自动降级单线程；支持 http 直发代理 / https CONNECT 隧道 |
+| **aria2 JSON-RPC**（主路径） | aria2c 可用（安装脚本已自动安装） | 多连接分片、断点续传、走代理（`all-proxy`）；**JSON-RPC 控制**：结构化进度（字节级，`--json` 模式也准确）、精确错误分类（超时 / 404 / 磁盘满 / 认证失败，来自 `errorCode`/`errorMessage`）；node 退出 aria2 自动退出，Ctrl+C 中断后下次自动续传 |
+| **aria2c legacy spawn**（回退） | RPC 实例起不来 | 一次性 spawn aria2c（只拿退出码，aria2c 自带进度条） |
+| **内置 Node 下载器**（兜底） | 未装 aria2c（零依赖） | HTTP Range 分片并发下载到 `.part`，完成后拼接；断点续传（完整分片自动跳过）；不支持 Range 或大小未知时自动降级单线程；支持 http 直发代理 / https CONNECT 隧道 |
 
-- **优先 aria2c**：装了自动用满速多连接下载（aria2c 自带进度条）；没装则用内置 Node 下载器，无需任何额外安装。
+- **aria2c 由安装脚本主动安装**：Windows 下载官方二进制到安装目录 `bin\`（GitHub release，SHA256 校验）；macOS/Linux 走 brew/apt/dnf/pacman。已在 PATH 的 aria2c 直接复用。安装失败不阻塞（内置 Node 下载器兜底）。
 - **断点续传**：中断后重跑同 URL 同目录，未完成的分片（`.part*`）自动续传；已完整文件直接跳过。
 - **Clash 离线兜底**：`dl` 检测不到 Clash 时自动改直连下载（不报错卡住）；`--no-proxy` 可强制直连。
 - **非公开 URL（需认证）**：用 `-H/--header "Name: value"` 指定认证头（可多次），下载时自动透传给探测 / 分片 / 单线程 / aria2c。若目标是不支持多连接的一次性签名 / 受限 URL，多线程分片遇 401/403/429 会自动降级为单线程完整下载，避免整体失败。
@@ -231,7 +234,7 @@ clash-proxy dl "https://example.com/file.bin" --no-proxy
 clash-proxy dl "https://example.com/file.bin" --json
 ```
 
-> **可选安装 aria2c**（获得更快的多连接下载）：
+> **aria2c 通常无需手动安装**——安装脚本会自动装（Windows 官方二进制 → 安装目录 `bin\`；macOS/Linux 走包管理器）。若自动安装失败，可手动：
 > - Windows：`winget install aria2.aria2` 或到 [aria2 Releases](https://github.com/aria2/aria2/releases) 下载
 > - macOS：`brew install aria2`
 > - Linux：`sudo apt install aria2`（Debian/Ubuntu）或 `sudo dnf install aria2`（Fedora）
@@ -243,7 +246,7 @@ clash-proxy dl "https://example.com/file.bin" --json
 - **针对 URL 精确测速**，而不是用固定测试站
 - **并发测速**（默认 12 路），全节点秒出结果
 - **自动建组**：`add` 全自动写增强文件 + reload（走 Verge 命令桥）
-- **`dl` 一体化多线程下载**：选节点 + 下载一步完成，aria2c 有则用、无则内置 Node 分片下载
+- **`dl` 一体化多线程下载**：选节点 + 下载一步完成，aria2c 有则用（JSON-RPC 结构化进度与错误分类）、无则内置 Node 分片下载
 - **`--json`** 结构化输出，天然适配 agent 工具调用
 - **幂等安装脚本**：重复运行只更新不产生重复 PATH 条目
 

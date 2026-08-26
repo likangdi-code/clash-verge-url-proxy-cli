@@ -40,7 +40,8 @@
  *   CLASH_SECRET  HTTP 模式下的 secret（命名管道无需）
  *
  * 下载走代理：curl --proxy http://127.0.0.1:7897 -L -O <url>
-^ * 多线程下载：clash-proxy dl <url>（内置 Node 分片下载器；装了 aria2c 则自动用它）
+ * 多线程下载：clash-proxy dl <url>（aria2 JSON-RPC 主引擎——安装脚本自动装 aria2c，
+ *   结构化进度与错误分类；RPC 起不来回退一次性 spawn；未装 aria2c 用内置 Node 分片兜底）
  */
 import net from 'node:net'
 import http from 'node:http'
@@ -618,10 +619,12 @@ async function cmdDownload(url, opts) {
       bytes: res.bytes ?? null,
       threads: res.threads ?? null,
       durationMs: res.durationMs ?? null,
-      error: res.ok ? null : (res.error ?? (res.exitCode != null ? `aria2c 退出码 ${res.exitCode}` : null)),
+      error: res.ok ? null : (res.error ?? (res.exitCode != null ? `退出码 ${res.exitCode}` : null)),
+      errorCode: res.ok ? null : (res.errorCode ?? null),
     }))
     if (res.ok) return
     process.exitCode = 1
+    return // --json 失败也到此为止：不落入人类可读分支（其 \r\x1b[K 会污染 stdout 的 JSON）
   }
 
   if (res.ok) {
@@ -633,7 +636,7 @@ async function cmdDownload(url, opts) {
     }
   } else {
     process.stdout.write('\r\x1b[K')
-    console.error(`✗ 下载失败: ${res.error ?? `aria2c 退出码 ${res.exitCode}`}`)
+    console.error(`✗ 下载失败: ${res.error ?? `退出码 ${res.exitCode}`}`)
     process.exitCode = 1
   }
 }

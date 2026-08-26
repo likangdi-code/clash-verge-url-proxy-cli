@@ -41,6 +41,8 @@ iex (Get-Content "$env:TEMP\install.ps1" -Raw -Encoding UTF8)
 | `clash-dl` 命令不存在 | 旧版安装脚本漏装下载器 → 重跑安装脚本（新版会装 downloader.mjs） |
 | 非公开 URL 401/403/429 | 缺认证头 → `-H "Authorization: Bearer ..."` / `-H "Cookie: ..."`；分片失败自动降级单线程，不整体失败 |
 | 断点续传无效 | 重跑同 URL 同目录才续传；换目录/文件名视为新任务 |
+| `dl` 结果 `engine: node`（没用 aria2c） | aria2c 未就绪 → 重跑安装脚本（自动装到安装目录 `bin\aria2c.exe`）；或手动 `winget install aria2.aria2` |
+| `--json` 里 `errorCode` 是数字 | aria2 错误码（RPC 引擎精确分类）：1=未知、3=资源不存在(404)、9=超时、13=无法创建文件(磁盘/权限)、18=断点续传被拒、22=HTTP 响应头异常 |
 
 ## 三、Skill 部署 / 重部署
 
@@ -64,3 +66,4 @@ skill 文件也可手动下载：
 - `add` 自动建组（写增强文件 + reload）；`pick` 只对已建组测速切换。全新域名用 `add`。
 - 测速**真实节点 + DIRECT**（跳过策略组）；DIRECT 参与：国内内容直连快会自动切 DIRECT。
 - `isUrlProxy: false` = 只切了 GLOBAL，仅未匹配规则的流量走它；需精准路由要在 Verge 为该域名建组。
+- 下载引擎三层：**aria2 JSON-RPC 主引擎**（专属实例：随机端口 + secret，node 退出自动清理不留孤儿；Ctrl+C 中断后重跑同 URL 同目录自动续传）→ RPC 起不来回退一次性 spawn → 内置 Node 分片兜底。aria2c 由安装脚本自动安装（Windows：安装目录 `bin\aria2c.exe`）；PATH 已有的官方 aria2c 直接复用。
