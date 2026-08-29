@@ -6,7 +6,7 @@
     clash-proxy-fix  — 安装与排障修复
 
   覆盖工具（检测到对应目录就装；统一 SKILL.md 开放标准）：
-    claude / gemini / codex / opencode / hermes / openclaw / grok
+    claude / codebuddy / workbuddy / gemini / codex / opencode / hermes / openclaw / grok
 
   用法：
     powershell -ExecutionPolicy Bypass -File deploy-agents.ps1
@@ -21,7 +21,7 @@
 param(
   [string]$SkillUrl = '',        # 显式指定单个 skill 的下载 URL（配 -SkillName）
   [string]$SourcePath = '',      # 用本地 SKILL.md（配 -SkillName）
-  [string]$Agent = '',           # 只部署指定工具：claude/gemini/codex/opencode/hermes/openclaw/grok
+  [string]$Agent = '',           # 只部署指定工具：claude/codebuddy/workbuddy/gemini/codex/opencode/hermes/openclaw/grok
   [string]$SkillName = 'clash-proxy'   # 配合 -SkillUrl/-SourcePath 自定义 skill 时用
 )
 $ErrorActionPreference = 'Continue'
@@ -75,13 +75,15 @@ function Invoke-DownloadChecked {
 
 # 2. 各 agent 工具： key -> (检测目录, skills 目录, 显示名)
 $targets = @(
-  @{ key = 'claude';    name = 'Claude Code'; dir = "$HOME\.claude";           skills = "$HOME\.claude\skills" },
-  @{ key = 'gemini';    name = 'Gemini';      dir = "$HOME\.gemini";          skills = "$HOME\.gemini\skills" },
-  @{ key = 'codex';     name = 'Codex';       dir = "$HOME\.codex";           skills = "$HOME\.codex\skills" },
-  @{ key = 'opencode';  name = 'OpenCode';    dir = "$HOME\.config\opencode"; skills = "$HOME\.config\opencode\skills" },
-  @{ key = 'hermes';    name = 'Hermes';      dir = "$HOME\.hermes";          skills = "$HOME\.hermes\skills" },
-  @{ key = 'openclaw';  name = 'OpenClaw';    dir = "$HOME\.openclaw";        skills = "$HOME\.openclaw\skills" },
-  @{ key = 'grok';      name = 'Grok';        dir = "$HOME\.grok";            skills = "$HOME\.grok\skills" }
+  @{ key = 'claude';     name = 'Claude Code'; dir = "$HOME\.claude";           skills = "$HOME\.claude\skills" },
+  @{ key = 'codebuddy';  name = 'CodeBuddy';   dir = "$HOME\.codebuddy";        skills = "$HOME\.codebuddy\skills" },
+  @{ key = 'workbuddy';  name = 'WorkBuddy';   dir = "$HOME\.workbuddy-ai";     skills = "$HOME\.workbuddy-ai\skills" },
+  @{ key = 'gemini';     name = 'Gemini';      dir = "$HOME\.gemini";           skills = "$HOME\.gemini\skills" },
+  @{ key = 'codex';      name = 'Codex';       dir = "$HOME\.codex";            skills = "$HOME\.codex\skills" },
+  @{ key = 'opencode';   name = 'OpenCode';    dir = "$HOME\.config\opencode";  skills = "$HOME\.config\opencode\skills" },
+  @{ key = 'hermes';     name = 'Hermes';      dir = "$HOME\.hermes";           skills = "$HOME\.hermes\skills" },
+  @{ key = 'openclaw';   name = 'OpenClaw';    dir = "$HOME\.openclaw";         skills = "$HOME\.openclaw\skills" },
+  @{ key = 'grok';       name = 'Grok';        dir = "$HOME\.grok";             skills = "$HOME\.grok\skills" }
 )
 
 # 过滤：-Agent 指定了则只处理该工具（支持逗号分隔多值，如 "claude,codex"）
@@ -89,7 +91,7 @@ if ($Agent) {
   $agentKeys = $Agent -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
   $unknown = $agentKeys | Where-Object { $_ -notin $targets.key }
   if ($unknown) {
-    Write-Error "未知工具: $($unknown -join ',')。可用：claude / gemini / codex / opencode / hermes / openclaw / grok"
+    Write-Error "未知工具: $($unknown -join ',')。可用：claude / codebuddy / workbuddy / gemini / codex / opencode / hermes / openclaw / grok"
     exit 1
   }
   $targets = $targets | Where-Object { $_.key -in $agentKeys }
@@ -178,5 +180,5 @@ if ($Agent) {
   Write-Host "已完成 [$Agent] 的 skill 部署。" -ForegroundColor DarkGray
 } else {
   Write-Host '提示：已装工具重启会话（或 /skills reload）后即可自主调用 clash-proxy。' -ForegroundColor DarkGray
-  Write-Host '单个工具单独补装：powershell -ExecutionPolicy Bypass -File deploy-agents.ps1 -Agent <claude|gemini|codex|opencode|hermes|openclaw|grok>' -ForegroundColor DarkGray
+  Write-Host '单个工具单独补装：powershell -ExecutionPolicy Bypass -File deploy-agents.ps1 -Agent <claude|codebuddy|workbuddy|gemini|codex|opencode|hermes|openclaw|grok>' -ForegroundColor DarkGray
 }

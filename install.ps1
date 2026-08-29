@@ -360,13 +360,15 @@ Write-Host '是否把 skill 部署到本机 agent 工具：' -ForegroundColor Cy
 Write-Host "  （读键路径：$(if ($script:ConInReady) { 'Win32' } else { 'RawUI 降级（按键可能无效）' })）" -ForegroundColor DarkGray
 # 与 deploy-agents.ps1 保持一致的 agent 清单（菜单列出全部，未检测到的置灰不可选）
 $targets = @(
-  @{ key = 'claude';    name = 'Claude Code'; dir = "$HOME\.claude" },
-  @{ key = 'gemini';    name = 'Gemini';      dir = "$HOME\.gemini" },
-  @{ key = 'codex';     name = 'Codex';       dir = "$HOME\.codex" },
-  @{ key = 'opencode';  name = 'OpenCode';    dir = "$HOME\.config\opencode" },
-  @{ key = 'hermes';    name = 'Hermes';      dir = "$HOME\.hermes" },
-  @{ key = 'openclaw';  name = 'OpenClaw';    dir = "$HOME\.openclaw" },
-  @{ key = 'grok';      name = 'Grok';        dir = "$HOME\.grok" }
+  @{ key = 'claude';     name = 'Claude Code'; dir = "$HOME\.claude" },
+  @{ key = 'codebuddy';  name = 'CodeBuddy';   dir = "$HOME\.codebuddy" },
+  @{ key = 'workbuddy';  name = 'WorkBuddy';   dir = "$HOME\.workbuddy-ai" },
+  @{ key = 'gemini';     name = 'Gemini';      dir = "$HOME\.gemini" },
+  @{ key = 'codex';      name = 'Codex';       dir = "$HOME\.codex" },
+  @{ key = 'opencode';   name = 'OpenCode';    dir = "$HOME\.config\opencode" },
+  @{ key = 'hermes';     name = 'Hermes';      dir = "$HOME\.hermes" },
+  @{ key = 'openclaw';   name = 'OpenClaw';    dir = "$HOME\.openclaw" },
+  @{ key = 'grok';       name = 'Grok';        dir = "$HOME\.grok" }
 )
 # 菜单列出全部 agent（已检测到的可选、默认选中；未检测到的置灰「不可选」）
 $menuItems = @()
