@@ -23,9 +23,13 @@
  *   --group <组名>     指定要切换的组（默认自动探测，无命中则 GLOBAL）
  *   --timeout <ms>     单节点测速超时（默认 5000）
  *   --concurrency <n>  并发测速数（默认 12）
- *   --top <n>          只显示延迟最低的前 n 个
- *   --json             输出 JSON
+ *   --top <n>          输出延迟最低的前 n 个（默认只给一行结论，不列排行）
+ *   --verbose, -v      输出完整信息（目标/组/排行/下载命令）
+ *   --json             输出 JSON（默认也只给结论字段，--top/--verbose 才带 top 列表）
  *   --no-switch        只测速不切换
+ *
+ * 默认输出面向 agent：一行结论（已切换到哪个节点、多少 ms）。候选里始终包含
+ * DIRECT，选到 DIRECT 表示「该 URL 直连最快」，走代理端口即由 mihomo 直连转发。
  *
  * dl 子命令专属选项：
  *   -o/--output <文件> 下载输出文件名（默认从 URL/Content-Disposition 推断）
@@ -277,12 +281,40 @@ function pickBest(results) {
   return best
 }
 
+// ─── 输出精简：默认一行结论，完整内容只在显式要求时出现 ─────────────────────
+//
+// agent 调用时只需要「切到哪个节点、多少 ms」这一个结论，候选延迟排行、提示语、
+// 下载命令都是噪声（会把上下文撑爆）。因此默认只输出结论行；要看细节用 --verbose
+// 或 --top n（JSON 同理：top 列表只在显式要求时才带）。
+
+/** 是否输出完整延迟排行：--top n 或 --verbose */
+const showTop = (opts) => Boolean(opts.top) || opts.verbose
+
+/** 排行列表本体：--top n 取 n 条，--verbose 默认取前 10 条（不全量刷屏） */
+const topList = (opts, sorted) => (showTop(opts) ? sorted.slice(0, opts.top || 10) : [])
+
+/** JSON 的 top 字段：与 showTop 同条件（默认不带，避免 agent 上下文浪费） */
+function topField(opts, sorted) {
+  if (!showTop(opts)) return {}
+  return { top: topList(opts, sorted).map((r) => ({ name: r.name, delay: r.delay })) }
+}
+
+/**
+ * 结论行（人类可读）：一行说清切到哪个节点。
+ * DIRECT 是合法最优结果——表示该 URL 直连最快，不是「没走代理」的失败态。
+ */
+function switchLine(group, best, switched) {
+  if (!best) return '⚠ 无可用节点（全部超时/失败）'
+  const tag = best.name === 'DIRECT' ? '  （直连最快）' : ''
+  return `✓ ${switched ? '已切换' : '最优'} ${group} → ${best.name} (${best.delay} ms)${tag}`
+}
+
 // ─── 主逻辑 ─────────────────────────────────────────────────────────────────
 
 async function main() {
   const argv = process.argv.slice(2)
   const opts = {
-    timeout: 5000, concurrency: 12, group: null, top: null, json: false, noSwitch: false,
+    timeout: 5000, concurrency: 12, group: null, top: null, json: false, noSwitch: false, verbose: false,
     output: null, dir: null, threads: 8, noProxy: false, forceNode: false, headers: null,
   }
   const headerList = []
@@ -294,6 +326,7 @@ async function main() {
     else if (a === '--concurrency') opts.concurrency = Number(argv[++i])
     else if (a === '--top') opts.top = Number(argv[++i])
     else if (a === '--json') opts.json = true
+    else if (a === '--verbose' || a === '-v') opts.verbose = true
     else if (a === '--no-switch') opts.noSwitch = true
     else if (a === '-o' || a === '--output') opts.output = argv[++i]
     else if (a === '-d' || a === '--dir') opts.dir = argv[++i]
@@ -431,22 +464,42 @@ async function cmdAdd(url, opts) {
       group = detectUrlProxyGroup(rules, host)
     } catch { /* 忽略 */ }
   }
+  let created = false
   if (!group) {
     group = await createUrlProxyGroup(host)
     if (!group) { console.error('✗ 建组失败（检查 Verge 命令桥 / 当前订阅增强配置）'); process.exit(1) }
-    console.log(`✓ 已创建网址代理组 ${group}（${host}）`)
-  } else {
-    console.log(`✓ 复用已有网址代理组 ${group}`)
+    created = true
   }
   const { candidates, sorted, best, switched } = await testAndSwitch(group, host, normalizedUrl, opts, false)
   if (opts.json) {
-    console.log(JSON.stringify({ ok: true, host, url: normalizedUrl, group, isUrlProxy: isUrlProxyName(group), bestNode: best?.name ?? null, bestDelay: best?.delay ?? null, switched, candidatesTested: candidates.length, top: sorted.slice(0, opts.top || 5).map((r) => ({ name: r.name, delay: r.delay })) }))
+    console.log(JSON.stringify({
+      ok: true,
+      host,
+      url: normalizedUrl,
+      group,
+      groupCreated: created,
+      isUrlProxy: isUrlProxyName(group),
+      bestNode: best?.name ?? null,
+      bestDelay: best?.delay ?? null,
+      bestIsDirect: best?.name === 'DIRECT',
+      switched,
+      candidatesTested: candidates.length,
+      ...topField(opts, sorted),
+    }))
     return
   }
-  console.log(`组: ${group}  测速节点: ${candidates.length} 个`)
-  if (best) console.log(`✓ 已切换 ${group} → ${best.name} (${best.delay} ms)`)
-  else console.log('⚠ 无可用节点（全部超时/失败）')
-  console.log(`下载: curl --proxy http://127.0.0.1:${process.env.CLASH_MIXED_PORT ?? DEFAULT_MIXED_PORT} -L -O '${url}'`)
+  // 默认只回结论；建组信息/排行/下载命令属细节，--verbose 才输出
+  if (created && opts.verbose) console.log(`✓ 已创建网址代理组 ${group}（${host}）`)
+  console.log(switchLine(group, best, switched))
+  if (opts.verbose) {
+    console.log(`目标: ${host}  (${normalizedUrl})`)
+    console.log(`组: ${group}  测速节点: ${candidates.length} 个`)
+    if (sorted.length) {
+      console.log('延迟最低:')
+      for (const r of topList(opts, sorted)) console.log(`  ${String(r.delay).padStart(6)} ms  ${r.name}`)
+    }
+    console.log(`下载: curl --proxy http://127.0.0.1:${process.env.CLASH_MIXED_PORT ?? DEFAULT_MIXED_PORT} -L -O '${url}'`)
+  }
 }
 
 async function cmdPick(url, opts, testOnly) {
@@ -466,7 +519,7 @@ async function cmdPick(url, opts, testOnly) {
     else console.error(msg)
     process.exit(1)
   }
-  const display = opts.top ? sorted.slice(0, opts.top) : sorted
+  const display = topList(opts, sorted)
   const result = {
     ok: true,
     host,
@@ -475,34 +528,39 @@ async function cmdPick(url, opts, testOnly) {
     isUrlProxy: isUrlProxyName(group),
     bestNode: best?.name ?? null,
     bestDelay: best?.delay ?? null,
+    bestIsDirect: best?.name === 'DIRECT',
     switched,
     candidatesTested: candidates.length,
     testUrl: normalizedUrl,
   }
   if (opts.json) {
-    console.log(JSON.stringify({ ...result, top: display.map((r) => ({ name: r.name, delay: r.delay })) }))
+    console.log(JSON.stringify({ ...result, ...topField(opts, sorted) }))
     return
   }
-  console.log(`目标: ${host}  (${normalizedUrl})`)
-  console.log(`切换组: ${group}${isUrlProxyName(group) ? ' (网址代理组)' : ' (GLOBAL 兜底)'}`)
-  console.log(`测速节点: ${candidates.length} 个`)
-  if (display.length === 0) {
-    console.log('⚠  无可用节点（全部超时/失败）')
-  } else {
-    console.log('延迟最低:')
-    for (const r of display) {
-      const mark = r.name === best?.name ? ' ◀' : ''
-      console.log(`  ${String(r.delay).padStart(6)} ms  ${r.name}${mark}`)
+  // 默认只回一行结论（agent 只需知道切到哪、多少 ms）
+  console.log(switchLine(group, best, switched) + (testOnly && best ? '（仅测速，未切换）' : ''))
+  if (!switched && !testOnly && best) {
+    console.log(`✗ 切换失败（HTTP ${switchStatus}；组可能不存在，可用 --group 显式指定）`)
+  }
+  if (opts.verbose) {
+    console.log(`目标: ${host}  (${normalizedUrl})`)
+    console.log(`切换组: ${group}${isUrlProxyName(group) ? ' (网址代理组)' : ' (GLOBAL 兜底)'}`)
+    console.log(`测速节点: ${candidates.length} 个`)
+    if (display.length === 0) {
+      console.log('⚠  无可用节点（全部超时/失败）')
+    } else {
+      console.log('延迟最低:')
+      for (const r of display) {
+        const mark = r.name === best?.name ? ' ◀' : ''
+        console.log(`  ${String(r.delay).padStart(6)} ms  ${r.name}${mark}`)
+      }
     }
+    if (!isUrlProxyName(group)) {
+      console.log('ℹ  该域名无网址代理组，已回退 GLOBAL。rule 模式下只有未匹配规则的流量走它；')
+      console.log('   如需精准路由，请先用 `clash-proxy add <url>` 自动建组。')
+    }
+    console.log(`下载: curl --proxy http://127.0.0.1:${process.env.CLASH_MIXED_PORT ?? DEFAULT_MIXED_PORT} -L -O '${url}'`)
   }
-  if (switched) console.log(`✓ 已切换 ${group} → ${best.name} (${best.delay} ms)`)
-  else if (!testOnly && best) console.log(`✗ 切换失败（HTTP ${switchStatus}；组可能不存在，可用 --group 显式指定）`)
-  else if (testOnly) console.log('(仅测速，未切换)')
-  if (!isUrlProxyName(group)) {
-    console.log('ℹ  该域名无网址代理组，已回退 GLOBAL。rule 模式下只有未匹配规则的流量走它；')
-    console.log('   如需精准路由，请先用 `clash-proxy add <url>` 自动建组。')
-  }
-  console.log(`下载: curl --proxy http://127.0.0.1:${process.env.CLASH_MIXED_PORT ?? DEFAULT_MIXED_PORT} -L -O '${url}'`)
 }
 
 /** 进度渲染：TTY 下用 \r 刷新一行，管道输出时只在开始时提示 */
@@ -548,14 +606,25 @@ async function cmdDownload(url, opts) {
       // --json 模式：提示信息走 stderr，避免污染 stdout 的 JSON 输出
       const log = (msg) => (opts.json ? console.error(msg) : console.log(msg))
       if (!group) {
-        group = await createUrlProxyGroup(host)
+        // 建组依赖 Verge 命令桥（与 mihomo IPC 不是同一个端口）。命令桥挂了不代表
+        // Clash 离线——不能因此关掉代理端口，回退 GLOBAL 继续测速选路即可。
+        try {
+          group = await createUrlProxyGroup(host)
+        } catch (e) {
+          log(`⚠ 自动建组失败（${e.message}），回退 GLOBAL 继续走代理下载`)
+        }
         if (group) log(`✓ 已创建网址代理组 ${group}（${host}）`)
+        else group = 'GLOBAL'
       }
       if (group) {
-        const { best: b, candidates } = await testAndSwitch(group, host, normalizedUrl, opts, false)
+        const { best: b, candidates, sorted } = await testAndSwitch(group, host, normalizedUrl, opts, false)
         best = b
-        if (best) log(`✓ 已切换 ${group} → ${best.name} (${best.delay} ms)`)
+        if (best) log(switchLine(group, best, true))
         else log(`⚠ 组 ${group} 无可测节点，仍走代理下载（可能用 GLOBAL/兜底）`)
+        if (opts.verbose && best) {
+          console.log(`测速节点: ${candidates.length} 个`)
+          for (const r of topList(opts, sorted)) console.log(`  ${String(r.delay).padStart(6)} ms  ${r.name}`)
+        }
       } else {
         log('⚠ 未检测到可用节点，仍尝试走代理下载')
       }
@@ -613,6 +682,7 @@ async function cmdDownload(url, opts) {
       group,
       bestNode: best?.name ?? null,
       bestDelay: best?.delay ?? null,
+      bestIsDirect: best?.name === 'DIRECT',
       proxy: proxyPort ? `http://127.0.0.1:${proxyPort}` : null,
       engine: res.engine ?? null,
       filePath: res.filePath ?? null,

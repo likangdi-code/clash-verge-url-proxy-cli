@@ -273,11 +273,15 @@ async function runAria2cRpc(url, { proxyPort, threads, output, dir, ariaPath, he
 
 /** 用 aria2c 下载（legacy 回退：RPC 实例起不来时才用；只拿退出码，无结构化状态） */
 function runAria2cLegacy(url, { proxyPort, threads, output, dir, ariaPath, headers, jsonMode }) {
+  const started = Date.now()
+  const outFile = output ? path.basename(output) : null
+  const outDir = output && path.isAbsolute(output) ? path.dirname(output) : (dir ?? '.')
   return new Promise((resolve) => {
     const args = [
       '--auto-file-renaming=false',
       '--allow-overwrite=true',
-      '--summary-interval=1',
+      '--summary-interval=0', // 静音周期进度表（下面 stdout 也会整段丢弃）
+      '--console-log-level=warn',
       '-x', String(threads),
       '-s', String(threads),
       '-k', '1M',
@@ -293,12 +297,26 @@ function runAria2cLegacy(url, { proxyPort, threads, output, dir, ariaPath, heade
     }
     if (dir) args.push('-d', dir)
     args.push(url)
-    // json 模式下静默（aria2c 进度输出会污染 stdout 的 JSON）；非 json 继承 stdio 展示进度
-    const stdio = jsonMode ? 'ignore' : 'inherit'
-    const child = spawn(ariaPath ?? 'aria2c', args, { stdio, shell: false })
-    child.on('error', (e) => resolve({ ok: false, engine: 'aria2c', error: e.message }))
+    // aria2c 的 NOTICE/进度汇总有几十行，对 agent 全是噪声：stdout 一律丢弃，
+    // stderr 收集起来，只在失败时随错误一起给出（也不污染 stdout 的 JSON）。
+    const child = spawn(ariaPath ?? 'aria2c', args, { stdio: ['ignore', 'ignore', 'pipe'], shell: false })
+    let stderr = ''
+    child.stderr?.on('data', (d) => { if (stderr.length < 4096) stderr += d.toString() })
+    child.on('error', (e) => resolve({ ok: false, engine: 'aria2c', error: e.message, threads, durationMs: Date.now() - started }))
     child.on('close', (code) => {
-      resolve({ ok: code === 0, engine: 'aria2c', filePath: output ? path.join(output && path.isAbsolute(output) ? path.dirname(output) : (dir ?? '.'), path.basename(output)) : null, exitCode: code })
+      const filePath = outFile ? path.join(outDir, outFile) : null
+      let bytes = null
+      try { bytes = filePath ? fs.statSync(filePath).size : null } catch {}
+      resolve({
+        ok: code === 0,
+        engine: 'aria2c',
+        filePath,
+        bytes,
+        threads,
+        durationMs: Date.now() - started,
+        exitCode: code,
+        error: code === 0 ? null : (stderr.trim().split('\n').slice(-2).join(' ') || `aria2c 退出码 ${code}`),
+      })
     })
   })
 }

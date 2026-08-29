@@ -64,6 +64,7 @@ skill 文件也可手动下载：
 ## 四、边界备忘（排障常踩的坑）
 
 - `add` 自动建组（写增强文件 + reload）；`pick` 只对已建组测速切换。全新域名用 `add`。
-- 测速**真实节点 + DIRECT**（跳过策略组）；DIRECT 参与：国内内容直连快会自动切 DIRECT。
+- 测速**真实节点 + DIRECT**（跳过策略组）；DIRECT 参与：直连快就自动切 DIRECT（`bestIsDirect: true` 是正常结果，不是「没走代理」）。
+- 默认输出**一行结论**（切到哪、多少 ms），`--verbose` / `--top n` 才给完整信息；`--json` 的 `top` 排行同理，别误判成「工具没测速」。
 - `isUrlProxy: false` = 只切了 GLOBAL，仅未匹配规则的流量走它；需精准路由要在 Verge 为该域名建组。
 - 下载引擎三层：**aria2 JSON-RPC 主引擎**（专属实例：随机端口 + secret，node 退出自动清理不留孤儿；Ctrl+C 中断后重跑同 URL 同目录自动续传）→ RPC 起不来回退一次性 spawn → 内置 Node 分片兜底。aria2c 由安装脚本自动安装（Windows：安装目录 `bin\aria2c.exe`）；PATH 已有的官方 aria2c 直接复用。
